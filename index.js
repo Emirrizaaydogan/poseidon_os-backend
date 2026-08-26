@@ -126,11 +126,29 @@ function sadeceAntrenor(req, res, next) {
 
 app.get('/athletes', girisGerekli, async (req, res) => {
   try {
-    const sonuc = await pool.query('SELECT * FROM athletes ORDER BY id ASC');
+    const sonuc = await pool.query(`
+      SELECT
+        a.*,
+        p.stil AS en_iyi_derece_stil,
+        p.mesafe AS en_iyi_derece_mesafe
+      FROM athletes a
+      LEFT JOIN LATERAL (
+        SELECT stil, mesafe, derece
+        FROM performance
+        WHERE athlete_id = a.id
+        ORDER BY derece ASC
+        LIMIT 1
+      ) p ON true
+      ORDER BY a.id ASC
+    `);
+
     res.json(sonuc.rows);
   } catch (hata) {
     console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: sporcular getirilemedi' });
+
+    res.status(500).json({
+      mesaj: 'Hata: sporcular getirilemedi'
+    });
   }
 });
 // ---------------- KAYIT EKRANI SPORCULARI ----------------
@@ -152,16 +170,38 @@ app.get('/athletes/register-list', async (req, res) => {
   }
 }); 
 app.post('/athletes', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const { isim, dogum_yili, grup, en_iyi_derece } = req.body;
+  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil } = req.body;
   try {
     const sonuc = await pool.query(
-      'INSERT INTO athletes (isim, dogum_yili, grup, en_iyi_derece) VALUES ($1, $2, $3, $4) RETURNING *',
-      [isim, dogum_yili, grup, en_iyi_derece]
+      'INSERT INTO athletes (isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil || null]
     );
     res.status(201).json(sonuc.rows[0]);
   } catch (hata) {
     console.error(hata);
     res.status(500).json({ mesaj: 'Hata: sporcu eklenemedi' });
+  }
+});
+
+// Antrenör, mevcut bir sporcunun en iyi derecesini/stilini sonradan
+// düzenleyebilir (örn. yeni bir yarış sonrası kayıt güncellenir).
+app.put('/athletes/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
+  const { id } = req.params;
+  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil } = req.body;
+  try {
+    const sonuc = await pool.query(
+      `UPDATE athletes
+       SET isim = $1, dogum_yili = $2, grup = $3, en_iyi_derece = $4, en_iyi_derece_stil = $5
+       WHERE id = $6 RETURNING *`,
+      [isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil || null, id]
+    );
+    if (sonuc.rows.length === 0) {
+      return res.status(404).json({ mesaj: 'Sporcu bulunamadı' });
+    }
+    res.json(sonuc.rows[0]);
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: sporcu güncellenemedi' });
   }
 });
 
@@ -468,6 +508,94 @@ app.patch('/dues/:id/pay', girisGerekli, async (req, res) => {
   } catch (hata) {
     console.error(hata);
     res.status(500).json({ mesaj: 'Hata: ödeme işaretlenemedi' });
+  }
+});
+
+// ---------------- KULLANICI YÖNETİMİ (VELİ / SPORCU HESAPLARI) ----------------
+
+// Antrenör panelinden sisteme kayıtlı veli/sporcu hesaplarını listeler.
+// Güvenlik için antrenör hesapları bu listede hiç görünmez/silinemez.
+app.get('/users', girisGerekli, sadeceAntrenor, async (req, res) => {
+  try {
+    const sonuc = await pool.query(`
+      SELECT u.id, u.email, u.role, u.athlete_id, a.isim AS athlete_isim
+      FROM users u
+      LEFT JOIN athletes a ON a.id = u.athlete_id
+      WHERE u.role IN ('veli', 'sporcu')
+      ORDER BY u.id DESC
+    `);
+    res.json(sonuc.rows);
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: kullanıcılar getirilemedi' });
+  }
+});
+
+// Antrenör, kayıt ekranını beklemeden doğrudan bir veli/sporcu hesabı açar.
+// Aynı anda, o hesabı sistemdeki bir sporcu kaydıyla eşleştirebilir.
+app.post('/users', girisGerekli, sadeceAntrenor, async (req, res) => {
+  const { email, password, role, athlete_id } = req.body;
+
+  if (!email || !password || !role) {
+    return res.status(400).json({ mesaj: 'E-posta, şifre ve rol zorunludur' });
+  }
+  if (!['veli', 'sporcu'].includes(role)) {
+    return res.status(400).json({ mesaj: 'Sadece veli veya sporcu hesabı eklenebilir' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+    const sonuc = await pool.query(
+      'INSERT INTO users (email, password_hash, role, athlete_id) VALUES ($1, $2, $3, $4) RETURNING id, email, role, athlete_id',
+      [email, passwordHash, role, athlete_id || null]
+    );
+    res.status(201).json(sonuc.rows[0]);
+  } catch (hata) {
+    console.error(hata);
+    if (hata.code === '23505') {
+      return res.status(409).json({ mesaj: 'Bu e-posta zaten kayıtlı' });
+    }
+    res.status(500).json({ mesaj: 'Kullanıcı eklenemedi' });
+  }
+});
+
+// Bir veli/sporcu hesabının hangi sporcu kaydına bağlı olduğunu günceller
+// (kayıt sırasında yanlış/eksik eşleştirme yapılmışsa antrenör düzeltebilir).
+app.patch('/users/:id/link-athlete', girisGerekli, sadeceAntrenor, async (req, res) => {
+  const { id } = req.params;
+  const { athlete_id } = req.body;
+  try {
+    const sonuc = await pool.query(
+      `UPDATE users SET athlete_id = $1 WHERE id = $2 AND role IN ('veli','sporcu') RETURNING id, email, role, athlete_id`,
+      [athlete_id || null, id]
+    );
+    if (sonuc.rows.length === 0) {
+      return res.status(404).json({ mesaj: 'Kullanıcı bulunamadı' });
+    }
+    res.json(sonuc.rows[0]);
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: eşleştirme güncellenemedi' });
+  }
+});
+
+// Antrenör bir veli/sporcu hesabının erişimini kaldırır.
+// role IN ('veli','sporcu') şartı, yanlışlıkla bir antrenör hesabının
+// silinmesini (kendi hesabı dahil) engelliyor.
+app.delete('/users/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const sonuc = await pool.query(
+      `DELETE FROM users WHERE id = $1 AND role IN ('veli','sporcu') RETURNING *`,
+      [id]
+    );
+    if (sonuc.rows.length === 0) {
+      return res.status(404).json({ mesaj: 'Kullanıcı bulunamadı ya da silinemez' });
+    }
+    res.status(204).send();
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: kullanıcı silinemedi' });
   }
 });
 

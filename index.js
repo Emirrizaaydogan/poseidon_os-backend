@@ -253,17 +253,84 @@ app.get('/performance', girisGerekli, async (req, res) => {
   try {
     let sonuc;
     if (athleteId) {
-      sonuc = await pool.query('SELECT * FROM performance WHERE athlete_id = $1 ORDER BY id ASC', [athleteId]);
+      sonuc = await pool.query(
+        'SELECT * FROM performance WHERE athlete_id = $1 ORDER BY id ASC',
+        [athleteId]
+      );
     } else {
-      sonuc = await pool.query('SELECT * FROM performance ORDER BY id ASC');
+      sonuc = await pool.query(
+        'SELECT * FROM performance ORDER BY id ASC'
+      );
     }
     res.json(sonuc.rows);
   } catch (hata) {
     console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: performans kayıtları getirilemedi' });
+    res.status(500).json({
+      mesaj: 'Hata: performans kayıtları getirilemedi'
+    });
+
   }
 });
+// ---------------- SPORCU SIRALAMALARI ----------------
 
+app.get('/rankings', girisGerekli, async (req, res) => {
+  const { stil, mesafe } = req.query;
+
+  try {
+    if (!stil || !mesafe) {
+      return res.status(400).json({
+        mesaj: 'Stil ve mesafe belirtilmelidir'
+      });
+    }
+
+    const sonuc = await pool.query(
+      `
+      SELECT
+        p.athlete_id,
+        a.isim,
+        a.grup,
+        p.stil,
+        p.mesafe,
+        MIN(p.derece) AS derece
+      FROM performance p
+      INNER JOIN athletes a
+        ON a.id = p.athlete_id
+      WHERE p.stil = $1
+        AND p.mesafe = $2
+      GROUP BY
+        p.athlete_id,
+        a.isim,
+        a.grup,
+        p.stil,
+        p.mesafe
+      ORDER BY
+        MIN(p.derece) ASC
+      `,
+      [stil, mesafe]
+    );
+
+    const siralama = sonuc.rows.map((sporcu, index) => {
+      return {
+        sira: index + 1,
+        athlete_id: sporcu.athlete_id,
+        isim: sporcu.isim,
+        grup: sporcu.grup,
+        stil: sporcu.stil,
+        mesafe: sporcu.mesafe,
+        derece: sporcu.derece,
+      };
+    });
+
+    res.json(siralama);
+
+  } catch (hata) {
+    console.error(hata);
+
+    res.status(500).json({
+      mesaj: 'Hata: sporcu sıralaması getirilemedi'
+    });
+  }
+});
 app.post('/performance', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { athlete_id, stil, mesafe, derece, tarih } = req.body;
   try {

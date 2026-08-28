@@ -4,6 +4,8 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = 3000;
@@ -14,6 +16,37 @@ app.use(express.json());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+
+// E-posta gönderimi için SMTP bağlantısı. Bu 4 değeri kendi .env
+// dosyanıza eklemeniz gerekiyor: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS.
+// (Gmail kullanacaksanız normal şifreniz değil, "Uygulama Şifresi"
+// oluşturmanız gerekir — Google hesap ayarlarından.)
+const mailGonderici = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: process.env.SMTP_PORT === '465',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+async function sifreSifirlamaKoduGonder(email, kod) {
+  await mailGonderici.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'Poseidon OS - Şifre Sıfırlama Kodu',
+    text: `Şifre sıfırlama kodunuz: ${kod}\nBu kod 15 dakika geçerlidir. Bu isteği siz yapmadıysanız bu e-postayı yok sayabilirsiniz.`,
+    html: `
+      <div style="font-family: sans-serif;">
+        <h2 style="color:#0a1a15;">Poseidon OS</h2>
+        <p>Şifre sıfırlama kodunuz:</p>
+        <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px;">${kod}</p>
+        <p style="color:#666;">Bu kod 15 dakika geçerlidir. Bu isteği siz yapmadıysanız bu e-postayı yok sayabilirsiniz.</p>
+      </div>
+    `,
+  });
+}
 
 app.get('/', (req, res) => {
   res.send('Poseidon OS Backend çalışıyor! 🌊');
@@ -126,29 +159,11 @@ function sadeceAntrenor(req, res, next) {
 
 app.get('/athletes', girisGerekli, async (req, res) => {
   try {
-    const sonuc = await pool.query(`
-      SELECT
-        a.*,
-        p.stil AS en_iyi_derece_stil,
-        p.mesafe AS en_iyi_derece_mesafe
-      FROM athletes a
-      LEFT JOIN LATERAL (
-        SELECT stil, mesafe, derece
-        FROM performance
-        WHERE athlete_id = a.id
-        ORDER BY derece ASC
-        LIMIT 1
-      ) p ON true
-      ORDER BY a.id ASC
-    `);
-
+    const sonuc = await pool.query('SELECT * FROM athletes ORDER BY id ASC');
     res.json(sonuc.rows);
   } catch (hata) {
     console.error(hata);
-
-    res.status(500).json({
-      mesaj: 'Hata: sporcular getirilemedi'
-    });
+    res.status(500).json({ mesaj: 'Hata: sporcular getirilemedi' });
   }
 });
 // ---------------- KAYIT EKRANI SPORCULARI ----------------
@@ -253,84 +268,17 @@ app.get('/performance', girisGerekli, async (req, res) => {
   try {
     let sonuc;
     if (athleteId) {
-      sonuc = await pool.query(
-        'SELECT * FROM performance WHERE athlete_id = $1 ORDER BY id ASC',
-        [athleteId]
-      );
+      sonuc = await pool.query('SELECT * FROM performance WHERE athlete_id = $1 ORDER BY id ASC', [athleteId]);
     } else {
-      sonuc = await pool.query(
-        'SELECT * FROM performance ORDER BY id ASC'
-      );
+      sonuc = await pool.query('SELECT * FROM performance ORDER BY id ASC');
     }
     res.json(sonuc.rows);
   } catch (hata) {
     console.error(hata);
-    res.status(500).json({
-      mesaj: 'Hata: performans kayıtları getirilemedi'
-    });
-
+    res.status(500).json({ mesaj: 'Hata: performans kayıtları getirilemedi' });
   }
 });
-// ---------------- SPORCU SIRALAMALARI ----------------
 
-app.get('/rankings', girisGerekli, async (req, res) => {
-  const { stil, mesafe } = req.query;
-
-  try {
-    if (!stil || !mesafe) {
-      return res.status(400).json({
-        mesaj: 'Stil ve mesafe belirtilmelidir'
-      });
-    }
-
-    const sonuc = await pool.query(
-      `
-      SELECT
-        p.athlete_id,
-        a.isim,
-        a.grup,
-        p.stil,
-        p.mesafe,
-        MIN(p.derece) AS derece
-      FROM performance p
-      INNER JOIN athletes a
-        ON a.id = p.athlete_id
-      WHERE p.stil = $1
-        AND p.mesafe = $2
-      GROUP BY
-        p.athlete_id,
-        a.isim,
-        a.grup,
-        p.stil,
-        p.mesafe
-      ORDER BY
-        MIN(p.derece) ASC
-      `,
-      [stil, mesafe]
-    );
-
-    const siralama = sonuc.rows.map((sporcu, index) => {
-      return {
-        sira: index + 1,
-        athlete_id: sporcu.athlete_id,
-        isim: sporcu.isim,
-        grup: sporcu.grup,
-        stil: sporcu.stil,
-        mesafe: sporcu.mesafe,
-        derece: sporcu.derece,
-      };
-    });
-
-    res.json(siralama);
-
-  } catch (hata) {
-    console.error(hata);
-
-    res.status(500).json({
-      mesaj: 'Hata: sporcu sıralaması getirilemedi'
-    });
-  }
-});
 app.post('/performance', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { athlete_id, stil, mesafe, derece, tarih } = req.body;
   try {
@@ -663,6 +611,100 @@ app.delete('/users/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
   } catch (hata) {
     console.error(hata);
     res.status(500).json({ mesaj: 'Hata: kullanıcı silinemedi' });
+  }
+});
+
+// ---------------- ŞİFRE SIFIRLAMA ----------------
+
+// Kullanıcı e-postasını girer, sistemde kayıtlıysa 6 haneli bir kod
+// üretilip e-postasına gönderilir. Güvenlik için: e-posta kayıtlı
+// olmasa bile aynı başarı mesajı döner (böylece dışarıdan bir
+// e-postanın sistemde olup olmadığı anlaşılamaz).
+app.post('/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ mesaj: 'E-posta zorunludur' });
+  }
+
+  try {
+    const kullaniciSonuc = await pool.query(
+      'SELECT id FROM users WHERE email = $1',
+      [email]
+    );
+
+    if (kullaniciSonuc.rows.length > 0) {
+      const kullaniciId = kullaniciSonuc.rows[0].id;
+      const kod = crypto.randomInt(100000, 999999).toString();
+      const sonKullanma = new Date(Date.now() + 15 * 60 * 1000); // 15 dakika
+
+      await pool.query(
+        'INSERT INTO password_resets (user_id, token, son_kullanma) VALUES ($1, $2, $3)',
+        [kullaniciId, kod, sonKullanma]
+      );
+
+      try {
+        await sifreSifirlamaKoduGonder(email, kod);
+      } catch (mailHatasi) {
+        console.error('E-posta gönderilemedi:', mailHatasi);
+        // E-posta gönderimi başarısız olursa kullanıcıya bunu açıkça
+        // söylüyoruz — aksi halde kod hiç gelmediği halde "gönderildi"
+        // denip kullanıcı boşuna beklerdi.
+        return res.status(500).json({
+          mesaj: 'Kod oluşturuldu ama e-posta gönderilemedi. SMTP ayarlarını kontrol edin.',
+        });
+      }
+    }
+
+    res.json({ mesaj: 'E-posta adresine kayıtlıysa bir sıfırlama kodu gönderildi' });
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: sıfırlama kodu gönderilemedi' });
+  }
+});
+
+// Kullanıcı e-postasına gelen kodu ve yeni şifresini girer.
+app.post('/auth/reset-password', async (req, res) => {
+  const { email, kod, yeniSifre } = req.body;
+  if (!email || !kod || !yeniSifre) {
+    return res.status(400).json({ mesaj: 'E-posta, kod ve yeni şifre zorunludur' });
+  }
+  if (yeniSifre.length < 6) {
+    return res.status(400).json({ mesaj: 'Şifre en az 6 karakter olmalı' });
+  }
+
+  try {
+    const kullaniciSonuc = await pool.query(
+      'SELECT id FROM users WHERE email = $1',
+      [email]
+    );
+    if (kullaniciSonuc.rows.length === 0) {
+      return res.status(400).json({ mesaj: 'Kod geçersiz veya süresi dolmuş' });
+    }
+    const kullaniciId = kullaniciSonuc.rows[0].id;
+
+    const kodSonuc = await pool.query(
+      `SELECT * FROM password_resets
+       WHERE user_id = $1 AND token = $2 AND kullanildi = false AND son_kullanma > now()
+       ORDER BY id DESC LIMIT 1`,
+      [kullaniciId, kod]
+    );
+    if (kodSonuc.rows.length === 0) {
+      return res.status(400).json({ mesaj: 'Kod geçersiz veya süresi dolmuş' });
+    }
+
+    const passwordHash = await bcrypt.hash(yeniSifre, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [
+      passwordHash,
+      kullaniciId,
+    ]);
+    await pool.query('UPDATE password_resets SET kullanildi = true WHERE id = $1', [
+      kodSonuc.rows[0].id,
+    ]);
+
+    res.json({ mesaj: 'Şifre başarıyla güncellendi' });
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: şifre güncellenemedi' });
   }
 });
 

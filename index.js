@@ -477,6 +477,63 @@ app.get('/dues', girisGerekli, async (req, res) => {
     });
   }
 });
+
+// ---------------- KARNE (FİZİKSEL UYGUNLUK) ----------------
+
+app.get('/karneler', girisGerekli, async (req, res) => {
+  const { athleteId } = req.query;
+  try {
+    let sonuc;
+
+    if (req.user.role === 'antrenor') {
+      if (athleteId) {
+        sonuc = await pool.query(
+          'SELECT * FROM karneler WHERE athlete_id = $1 ORDER BY id DESC',
+          [athleteId]
+        );
+      } else {
+        sonuc = await pool.query('SELECT * FROM karneler ORDER BY id DESC');
+      }
+      return res.json(sonuc.rows);
+    }
+
+    if (req.user.role === 'veli') {
+      const kullanici = await pool.query(
+        'SELECT athlete_id FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      const veliSporcuId = kullanici.rows[0]?.athlete_id;
+      if (!veliSporcuId) {
+        return res.status(403).json({ mesaj: 'Bu veli hesabına bağlı sporcu bulunamadı' });
+      }
+      sonuc = await pool.query(
+        'SELECT * FROM karneler WHERE athlete_id = $1 ORDER BY id DESC',
+        [veliSporcuId]
+      );
+      return res.json(sonuc.rows);
+    }
+
+    return res.status(403).json({ mesaj: 'Karnelere erişim yetkin yok' });
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: karneler getirilemedi' });
+  }
+});
+
+app.post('/karneler', girisGerekli, sadeceAntrenor, async (req, res) => {
+  const { athlete_id, tarih, olcumler, teknik_degerlendirme } = req.body;
+  try {
+    const sonuc = await pool.query(
+      'INSERT INTO karneler (athlete_id, tarih, olcumler, teknik_degerlendirme) VALUES ($1, $2, $3, $4) RETURNING *',
+      [athlete_id, tarih, JSON.stringify(olcumler || {}), JSON.stringify(teknik_degerlendirme || {})]
+    );
+    //sadadada
+    res.status(201).json(sonuc.rows[0]);
+  } catch (hata) {
+    console.error(hata);
+    res.status(500).json({ mesaj: 'Hata: karne eklenemedi' });
+  }
+});
 // ---------------- AİDAT SON ÖDEME TARİHİ ----------------
 
 // Antrenör, belirlenen ayın aidatlarının son ödeme tarihini günceller.

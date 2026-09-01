@@ -278,69 +278,6 @@ app.get('/performance', girisGerekli, async (req, res) => {
     res.status(500).json({ mesaj: 'Hata: performans kayıtları getirilemedi' });
   }
 });
-// ---------------- SPORCU SIRALAMALARI ----------------
-
-app.get('/rankings', girisGerekli, async (req, res) => {
-  const { stil, mesafe } = req.query;
-
-  try {
-    if (!stil || !mesafe) {
-      return res.status(400).json({
-        mesaj: 'Stil ve mesafe belirtilmelidir'
-      });
-    }
-
-    const sonuc = await pool.query(
-      `
-      SELECT
-        p.athlete_id,
-        a.isim,
-        a.dogum_yili,
-        a.grup,
-        p.stil,
-        p.mesafe,
-        MIN(p.derece) AS derece
-      FROM performance p
-      INNER JOIN athletes a
-        ON a.id = p.athlete_id
-      WHERE p.stil = $1
-        AND p.mesafe = $2
-      GROUP BY
-        p.athlete_id,
-        a.isim,
-        a.dogum_yili,
-        a.grup,
-        p.stil,
-        p.mesafe
-      ORDER BY
-        MIN(p.derece) ASC
-      `,
-      [stil, mesafe]
-    );
-
-    const siralama = sonuc.rows.map((sporcu, index) => {
-      return {
-        sira: index + 1,
-        athlete_id: sporcu.athlete_id,
-        isim: sporcu.isim,
-        dogum_yili: sporcu.dogum_yili,
-        grup: sporcu.grup,
-        stil: sporcu.stil,
-        mesafe: sporcu.mesafe,
-        derece: sporcu.derece,
-      };
-    });
-
-    res.json(siralama);
-
-  } catch (hata) {
-    console.error(hata);
-
-    res.status(500).json({
-      mesaj: 'Hata: sporcu sıralaması getirilemedi'
-    });
-  }
-});
 
 app.post('/performance', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { athlete_id, stil, mesafe, derece, tarih } = req.body;
@@ -356,17 +293,55 @@ app.post('/performance', girisGerekli, sadeceAntrenor, async (req, res) => {
   }
 });
 
-// ---------------- YOKLAMA ----------------
+// ---------------- YOKLAMA (GİRİŞ / ÇIKIŞ) ----------------
 
+// Bir antrenmana ait yoklama kayıtlarını sporcu ismiyle birlikte getirir.
+// Antrenör hepsini görebilir; veli/sporcu sadece kendi sporcusununkini görür.
 app.get('/attendance', girisGerekli, async (req, res) => {
-  const { trainingId } = req.query;
+  const { trainingId, athleteId } = req.query;
+
   try {
-    let sonuc;
-    if (trainingId) {
-      sonuc = await pool.query('SELECT * FROM attendance WHERE training_id = $1 ORDER BY id ASC', [trainingId]);
-    } else {
-      sonuc = await pool.query('SELECT * FROM attendance ORDER BY id ASC');
+    let etkinAthleteId = athleteId;
+
+    if (req.user.role !== 'antrenor') {
+      const kullanici = await pool.query(
+        'SELECT athlete_id FROM users WHERE id = $1',
+        [req.user.id]
+      );
+      const kendiSporcuId = kullanici.rows[0]?.athlete_id;
+
+      if (!kendiSporcuId) {
+        return res.status(403).json({
+          mesaj: 'Bu hesaba bağlı bir sporcu bulunamadı',
+        });
+      }
+      if (athleteId && parseInt(athleteId) !== parseInt(kendiSporcuId)) {
+        return res.status(403).json({
+          mesaj: 'Bu sporcunun yoklama bilgilerine erişemezsin',
+        });
+      }
+      etkinAthleteId = kendiSporcuId;
     }
+
+    let sorgu = `
+      SELECT a.*, at.isim AS athlete_isim
+      FROM attendance a
+      JOIN athletes at ON at.id = a.athlete_id
+      WHERE 1=1
+    `;
+    const parametreler = [];
+
+    if (trainingId) {
+      parametreler.push(trainingId);
+      sorgu += ` AND a.training_id = $${parametreler.length}`;
+    }
+    if (etkinAthleteId) {
+      parametreler.push(etkinAthleteId);
+      sorgu += ` AND a.athlete_id = $${parametreler.length}`;
+    }
+    sorgu += ' ORDER BY a.id ASC';
+
+    const sonuc = await pool.query(sorgu, parametreler);
     res.json(sonuc.rows);
   } catch (hata) {
     console.error(hata);
@@ -374,17 +349,62 @@ app.get('/attendance', girisGerekli, async (req, res) => {
   }
 });
 
+// Sporcu QR kodu okuttuğunda çağrılır. 'tip' 'giris' ya da 'cikis' olur.
+// Her (antrenman, sporcu) çifti için tek satır tutulur: önce giriş_zamani,
+// sonra çıkış_zamanı doldurulur — böylece veli tek kayıtta hem "girdi"
+// hem "çıktı" bilgisini görebilir.
 app.post('/attendance', girisGerekli, async (req, res) => {
-  const { training_id } = req.body;
+  const { training_id, athlete_id, tip } = req.body;
+
+  if (!training_id || !athlete_id || !tip) {
+    return res.status(400).json({
+      mesaj: 'training_id, athlete_id ve tip zorunludur',
+    });
+  }
+  if (!['giris', 'cikis'].includes(tip)) {
+    return res.status(400).json({ mesaj: "tip 'giris' ya da 'cikis' olmalı" });
+  }
+
   try {
-    const sonuc = await pool.query(
-      'INSERT INTO attendance (training_id) VALUES ($1) RETURNING *',
-      [training_id]
+    const mevcut = await pool.query(
+      'SELECT * FROM attendance WHERE training_id = $1 AND athlete_id = $2',
+      [training_id, athlete_id]
     );
-    res.status(201).json(sonuc.rows[0]);
+
+    if (tip === 'giris') {
+      if (mevcut.rows.length > 0 && mevcut.rows[0].giris_zamani) {
+        return res.status(409).json({ mesaj: 'Bu sporcu zaten giriş yaptı' });
+      }
+      if (mevcut.rows.length > 0) {
+        const sonuc = await pool.query(
+          'UPDATE attendance SET giris_zamani = now() WHERE id = $1 RETURNING *',
+          [mevcut.rows[0].id]
+        );
+        return res.json(sonuc.rows[0]);
+      }
+      const sonuc = await pool.query(
+        `INSERT INTO attendance (training_id, athlete_id, giris_zamani)
+         VALUES ($1, $2, now()) RETURNING *`,
+        [training_id, athlete_id]
+      );
+      return res.status(201).json(sonuc.rows[0]);
+    }
+
+    // tip === 'cikis'
+    if (mevcut.rows.length === 0 || !mevcut.rows[0].giris_zamani) {
+      return res.status(400).json({ mesaj: 'Önce giriş yapman gerekiyor' });
+    }
+    if (mevcut.rows[0].cikis_zamani) {
+      return res.status(409).json({ mesaj: 'Bu sporcu zaten çıkış yaptı' });
+    }
+    const sonuc = await pool.query(
+      'UPDATE attendance SET cikis_zamani = now() WHERE id = $1 RETURNING *',
+      [mevcut.rows[0].id]
+    );
+    res.json(sonuc.rows[0]);
   } catch (hata) {
     console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: yoklama eklenemedi' });
+    res.status(500).json({ mesaj: 'Hata: yoklama kaydedilemedi' });
   }
 });
 
@@ -475,63 +495,6 @@ app.get('/dues', girisGerekli, async (req, res) => {
     res.status(500).json({
       mesaj: 'Hata: aidat kayıtları getirilemedi'
     });
-  }
-});
-
-// ---------------- KARNE (FİZİKSEL UYGUNLUK) ----------------
-
-app.get('/karneler', girisGerekli, async (req, res) => {
-  const { athleteId } = req.query;
-  try {
-    let sonuc;
-
-    if (req.user.role === 'antrenor') {
-      if (athleteId) {
-        sonuc = await pool.query(
-          'SELECT * FROM karneler WHERE athlete_id = $1 ORDER BY id DESC',
-          [athleteId]
-        );
-      } else {
-        sonuc = await pool.query('SELECT * FROM karneler ORDER BY id DESC');
-      }
-      return res.json(sonuc.rows);
-    }
-
-    if (req.user.role === 'veli') {
-      const kullanici = await pool.query(
-        'SELECT athlete_id FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      const veliSporcuId = kullanici.rows[0]?.athlete_id;
-      if (!veliSporcuId) {
-        return res.status(403).json({ mesaj: 'Bu veli hesabına bağlı sporcu bulunamadı' });
-      }
-      sonuc = await pool.query(
-        'SELECT * FROM karneler WHERE athlete_id = $1 ORDER BY id DESC',
-        [veliSporcuId]
-      );
-      return res.json(sonuc.rows);
-    }
-
-    return res.status(403).json({ mesaj: 'Karnelere erişim yetkin yok' });
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: karneler getirilemedi' });
-  }
-});
-
-app.post('/karneler', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const { athlete_id, tarih, olcumler, teknik_degerlendirme } = req.body;
-  try {
-    const sonuc = await pool.query(
-      'INSERT INTO karneler (athlete_id, tarih, olcumler, teknik_degerlendirme) VALUES ($1, $2, $3, $4) RETURNING *',
-      [athlete_id, tarih, JSON.stringify(olcumler || {}), JSON.stringify(teknik_degerlendirme || {})]
-    );
-    //sadadada
-    res.status(201).json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: karne eklenemedi' });
   }
 });
 // ---------------- AİDAT SON ÖDEME TARİHİ ----------------

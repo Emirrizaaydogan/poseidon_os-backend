@@ -292,7 +292,361 @@ app.post('/performance', girisGerekli, sadeceAntrenor, async (req, res) => {
     res.status(500).json({ mesaj: 'Hata: performans kaydı eklenemedi' });
   }
 });
+// ---------------- KULÜP SIRALAMASI ----------------
 
+app.get('/rankings', girisGerekli, async (req, res) => {
+  const { stil, mesafe } = req.query;
+
+  if (!stil || !mesafe) {
+    return res.status(400).json({
+      mesaj: 'Stil ve mesafe belirtilmelidir',
+    });
+  }
+
+  try {
+    const sonuc = await pool.query(
+      `
+      SELECT
+        p.athlete_id,
+        a.isim,
+        a.dogum_yili,
+        a.grup,
+        p.stil,
+        p.mesafe,
+        MIN(p.derece) AS derece
+      FROM performance p
+      INNER JOIN athletes a
+        ON a.id = p.athlete_id
+      WHERE p.stil = $1
+        AND p.mesafe = $2
+      GROUP BY
+        p.athlete_id,
+        a.isim,
+        a.dogum_yili,
+        a.grup,
+        p.stil,
+        p.mesafe
+      ORDER BY MIN(p.derece) ASC
+      `,
+      [stil, mesafe]
+    );
+
+    const siralama = sonuc.rows.map((sporcu, index) => ({
+      sira: index + 1,
+      athlete_id: sporcu.athlete_id,
+      isim: sporcu.isim,
+      dogum_yili: sporcu.dogum_yili,
+      grup: sporcu.grup,
+      stil: sporcu.stil,
+      mesafe: sporcu.mesafe,
+      derece: sporcu.derece,
+    }));
+
+    res.json(siralama);
+  } catch (hata) {
+    console.error(hata);
+
+    res.status(500).json({
+      mesaj: 'Hata: sporcu sıralaması getirilemedi',
+    });
+  }
+});
+// ========================================================
+// SPORCU KARNELERİ
+// ========================================================
+
+// --------------------------------------------------------
+// KARNE OLUŞTUR
+// Sadece antrenör yeni karne oluşturabilir.
+// --------------------------------------------------------
+
+app.post(
+  '/report-cards',
+  girisGerekli,
+  sadeceAntrenor,
+  async (req, res) => {
+    const {
+      athlete_id,
+      test_date,
+      anthropometric,
+      motor_tests,
+      basic_swim,
+      freestyle,
+      backstroke,
+      breaststroke,
+      butterfly,
+      coach_note,
+    } = req.body;
+
+    if (!athlete_id || !test_date) {
+      return res.status(400).json({
+        mesaj: 'Sporcu ve test tarihi zorunludur',
+      });
+    }
+
+    try {
+      // Sporcu gerçekten var mı?
+      const sporcuSonuc = await pool.query(
+        `
+        SELECT id
+        FROM athletes
+        WHERE id = $1
+        `,
+        [athlete_id]
+      );
+
+      if (sporcuSonuc.rows.length === 0) {
+        return res.status(404).json({
+          mesaj: 'Sporcu bulunamadı',
+        });
+      }
+
+      const sonuc = await pool.query(
+        `
+        INSERT INTO report_cards (
+          athlete_id,
+          test_date,
+          anthropometric,
+          motor_tests,
+          basic_swim,
+          freestyle,
+          backstroke,
+          breaststroke,
+          butterfly,
+          coach_note,
+          created_by
+        )
+        VALUES (
+          $1,
+          $2,
+          $3::jsonb,
+          $4::jsonb,
+          $5::jsonb,
+          $6::jsonb,
+          $7::jsonb,
+          $8::jsonb,
+          $9::jsonb,
+          $10,
+          $11
+        )
+        RETURNING *
+        `,
+        [
+          athlete_id,
+          test_date,
+          JSON.stringify(anthropometric || {}),
+          JSON.stringify(motor_tests || {}),
+          JSON.stringify(basic_swim || {}),
+          JSON.stringify(freestyle || {}),
+          JSON.stringify(backstroke || {}),
+          JSON.stringify(breaststroke || {}),
+          JSON.stringify(butterfly || {}),
+          coach_note || null,
+          req.user.id,
+        ]
+      );
+
+      return res.status(201).json(sonuc.rows[0]);
+    } catch (hata) {
+      console.error('Karne oluşturma hatası:', hata);
+
+      // Aynı sporcuya aynı tarihte ikinci karne açılmasını engelleyen
+      // UNIQUE (athlete_id, test_date) constraint'i.
+      if (hata.code === '23505') {
+        return res.status(409).json({
+          mesaj: 'Bu sporcu için bu tarihte zaten bir karne bulunuyor',
+        });
+      }
+
+      return res.status(500).json({
+        mesaj: 'Karne oluşturulamadı',
+      });
+    }
+  }
+);
+
+
+// --------------------------------------------------------
+// KARNELERİ GETİR
+//
+// Antrenör:
+//   /report-cards
+//   -> bütün karneleri görebilir
+//
+//   /report-cards?athleteId=5
+//   -> yalnızca 5 numaralı sporcunun karnelerini görür
+//
+// Veli / Sporcu:
+//   -> yalnızca kendi athlete_id'sine bağlı karneleri görür.
+// --------------------------------------------------------
+
+app.get('/report-cards', girisGerekli, async (req, res) => {
+  const { athleteId } = req.query;
+
+  try {
+    let etkinAthleteId = null;
+
+    // ---------------- ANTRENÖR ----------------
+
+    if (req.user.role === 'antrenor') {
+      if (athleteId) {
+        etkinAthleteId = athleteId;
+      }
+    }
+
+    // ---------------- VELİ / SPORCU ----------------
+
+    else {
+      const kullaniciSonuc = await pool.query(
+        `
+        SELECT athlete_id
+        FROM users
+        WHERE id = $1
+        `,
+        [req.user.id]
+      );
+
+      const kendiSporcuId =
+        kullaniciSonuc.rows[0]?.athlete_id;
+
+      if (!kendiSporcuId) {
+        return res.status(403).json({
+          mesaj: 'Bu hesaba bağlı sporcu bulunamadı',
+        });
+      }
+
+      // URL üzerinden başka çocuğun ID'si gönderilmeye çalışılırsa engelle.
+      if (
+        athleteId &&
+        parseInt(athleteId) !== parseInt(kendiSporcuId)
+      ) {
+        return res.status(403).json({
+          mesaj: 'Bu sporcunun karnelerine erişemezsin',
+        });
+      }
+
+      etkinAthleteId = kendiSporcuId;
+    }
+
+    let sorgu = `
+      SELECT
+        rc.*,
+        a.isim AS athlete_isim,
+        a.dogum_yili,
+        a.dogum_tarihi,
+        a.cinsiyet,
+        a.grup
+      FROM report_cards rc
+      INNER JOIN athletes a
+        ON a.id = rc.athlete_id
+    `;
+
+    const parametreler = [];
+
+    if (etkinAthleteId) {
+      parametreler.push(etkinAthleteId);
+
+      sorgu += `
+        WHERE rc.athlete_id = $1
+      `;
+    }
+
+    sorgu += `
+      ORDER BY rc.test_date DESC, rc.id DESC
+    `;
+
+    const sonuc = await pool.query(
+      sorgu,
+      parametreler
+    );
+
+    return res.json(sonuc.rows);
+  } catch (hata) {
+    console.error('Karne listeleme hatası:', hata);
+
+    return res.status(500).json({
+      mesaj: 'Karneler getirilemedi',
+    });
+  }
+});
+
+
+// --------------------------------------------------------
+// TEK KARNEYİ GETİR
+// Örn: GET /report-cards/12
+// --------------------------------------------------------
+
+app.get('/report-cards/:id', girisGerekli, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const sonuc = await pool.query(
+      `
+      SELECT
+        rc.*,
+        a.isim AS athlete_isim,
+        a.dogum_yili,
+        a.dogum_tarihi,
+        a.cinsiyet,
+        a.grup
+      FROM report_cards rc
+      INNER JOIN athletes a
+        ON a.id = rc.athlete_id
+      WHERE rc.id = $1
+      `,
+      [id]
+    );
+
+    if (sonuc.rows.length === 0) {
+      return res.status(404).json({
+        mesaj: 'Karne bulunamadı',
+      });
+    }
+
+    const karne = sonuc.rows[0];
+
+    // Antrenör istediği karneyi görebilir.
+    if (req.user.role === 'antrenor') {
+      return res.json(karne);
+    }
+
+    // Veli / sporcu yalnızca kendi kaydına erişebilir.
+    const kullaniciSonuc = await pool.query(
+      `
+      SELECT athlete_id
+      FROM users
+      WHERE id = $1
+      `,
+      [req.user.id]
+    );
+
+    const kendiSporcuId =
+      kullaniciSonuc.rows[0]?.athlete_id;
+
+    if (!kendiSporcuId) {
+      return res.status(403).json({
+        mesaj: 'Bu hesaba bağlı sporcu bulunamadı',
+      });
+    }
+
+    if (
+      parseInt(karne.athlete_id) !==
+      parseInt(kendiSporcuId)
+    ) {
+      return res.status(403).json({
+        mesaj: 'Bu karneye erişim yetkin yok',
+      });
+    }
+
+    return res.json(karne);
+  } catch (hata) {
+    console.error('Karne getirme hatası:', hata);
+
+    return res.status(500).json({
+      mesaj: 'Karne getirilemedi',
+    });
+  }
+});
 // ---------------- YOKLAMA (GİRİŞ / ÇIKIŞ) ----------------
 
 // Bir antrenmana ait yoklama kayıtlarını sporcu ismiyle birlikte getirir.

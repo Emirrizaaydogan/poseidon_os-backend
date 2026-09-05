@@ -64,6 +64,8 @@ app.post('/auth/register', async (req, res) => {
   }
 
   try {
+    const baglantiHatasi = await sporcuBaglantisiHatasi(athlete_id);
+    if (baglantiHatasi) return res.status(400).json({ mesaj: baglantiHatasi });
     // Şifreyi asla düz metin olarak saklamıyoruz — bcrypt ile "hash"liyoruz.
     // Hash, şifreden geri döndürülemeyen, tek yönlü bir şifreleme işlemi.
     const passwordHash = await bcrypt.hash(password, 10);
@@ -155,6 +157,64 @@ function sadeceAntrenor(req, res, next) {
   next();
 }
 
+// Tarih ve ölçüm girişleri API üzerinden de doğrulanır.
+function sporcuBilgisiHatasi(veri) {
+  if (typeof veri.isim !== 'string' || !veri.isim.trim()) return 'İsim zorunludur';
+  const tarih = veri.dogum_tarihi;
+  if (typeof tarih !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(tarih)) {
+    return 'Doğum tarihi YYYY-MM-DD biçiminde zorunludur';
+  }
+  const d = new Date(tarih + 'T00:00:00Z');
+  if (!Number.isFinite(d.getTime()) || d.toISOString().slice(0, 10) !== tarih
+      || tarih < '1900-01-01' || tarih > new Date().toISOString().slice(0, 10)) {
+    return 'Geçerli, gelecekte olmayan bir doğum tarihi gir';
+  }
+  if (!['erkek', 'kiz'].includes(veri.cinsiyet)) return 'Cinsiyet seçmelisin';
+  return null;
+}
+
+async function sporcuBaglantisiHatasi(id) {
+  if (id === null || id === undefined) return null;
+  if (!Number.isSafeInteger(id) || id <= 0) return 'Geçerli bir sporcu seç';
+  const sonuc = await pool.query('SELECT id FROM athletes WHERE id = $1', [id]);
+  return sonuc.rows.length ? null : 'Seçilen sporcu bulunamadı';
+}
+
+function karneOlcumleriniDogrula(anthropometric, motor_tests) {
+  for (const veri of [anthropometric, motor_tests]) {
+    if (veri != null && (typeof veri !== 'object' || Array.isArray(veri))) {
+      throw new Error('Ölçümler nesne biçiminde olmalı');
+    }
+  }
+  const a = { ...(anthropometric || {}) };
+  const m = { ...(motor_tests || {}) };
+  const pozitif = ['ayak_uzunlugu','ayak_genisligi','boy','el_genisligi',
+    'el_uzunlugu','gogus_cevresi','kulac_uzunlugu','oturma_yuksekligi','vucut_agirligi'];
+  const motor = ['otur_eris','sirt_kasima_sag','sirt_kasima_sol','flamingo'];
+  for (const [veri, alanlar] of [[a, pozitif], [m, motor]]) {
+    for (const alan of alanlar) {
+      if (!(alan in veri)) continue;
+      const v = veri[alan];
+      if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(alan + ': geçerli sayı gerekli');
+      if (veri === a && v <= 0) throw new Error(alan + ': sıfırdan büyük olmalı');
+    }
+  }
+  if ('boy' in a && (a.boy < 30 || a.boy > 300)) {
+    throw new Error('Boyu santimetre olarak gir: örneğin 1,57 yerine 157');
+  }
+  if ('flamingo' in m && (!Number.isInteger(m.flamingo) || m.flamingo < 0)) {
+    throw new Error('Flamingo hata sayısı sıfır veya pozitif tam sayı olmalı');
+  }
+  // İstemciden gelen VKİ yerine ölçümlerden yeniden hesapla.
+  delete m.vki;
+  if (a.boy != null && a.vucut_agirligi != null) {
+    const vki = a.vucut_agirligi / ((a.boy / 100) ** 2);
+    if (!Number.isFinite(vki)) throw new Error('Boy ve kilo değerlerini kontrol et');
+    m.vki = Number(vki.toFixed(2));
+  }
+  return { anthropometric: a, motor_tests: m };
+}
+
 // ---------------- SPORCULAR ----------------
 
 app.get('/athletes', girisGerekli, async (req, res) => {
@@ -185,11 +245,13 @@ app.get('/athletes/register-list', async (req, res) => {
   }
 }); 
 app.post('/athletes', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil } = req.body;
+  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil, dogum_tarihi, cinsiyet } = req.body;
+  const hataMesaji = sporcuBilgisiHatasi(req.body);
+  if (hataMesaji) return res.status(400).json({ mesaj: hataMesaji });
   try {
     const sonuc = await pool.query(
-      'INSERT INTO athletes (isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil || null]
+      'INSERT INTO athletes (isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil, dogum_tarihi, cinsiyet) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [isim.trim(), Number(dogum_tarihi.slice(0, 4)), grup, en_iyi_derece, en_iyi_derece_stil || null, dogum_tarihi, cinsiyet]
     );
     res.status(201).json(sonuc.rows[0]);
   } catch (hata) {
@@ -202,13 +264,15 @@ app.post('/athletes', girisGerekli, sadeceAntrenor, async (req, res) => {
 // düzenleyebilir (örn. yeni bir yarış sonrası kayıt güncellenir).
 app.put('/athletes/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { id } = req.params;
-  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil } = req.body;
+  const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil, dogum_tarihi, cinsiyet } = req.body;
+  const hataMesaji = sporcuBilgisiHatasi(req.body);
+  if (hataMesaji) return res.status(400).json({ mesaj: hataMesaji });
   try {
     const sonuc = await pool.query(
       `UPDATE athletes
-       SET isim = $1, dogum_yili = $2, grup = $3, en_iyi_derece = $4, en_iyi_derece_stil = $5
-       WHERE id = $6 RETURNING *`,
-      [isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil || null, id]
+       SET isim = $1, dogum_yili = $2, grup = $3, en_iyi_derece = $4, en_iyi_derece_stil = $5, dogum_tarihi = $6, cinsiyet = $7
+       WHERE id = $8 RETURNING *`,
+      [isim.trim(), Number(dogum_tarihi.slice(0, 4)), grup, en_iyi_derece, en_iyi_derece_stil || null, dogum_tarihi, cinsiyet, id]
     );
     if (sonuc.rows.length === 0) {
       return res.status(404).json({ mesaj: 'Sporcu bulunamadı' });
@@ -384,6 +448,13 @@ app.post(
       });
     }
 
+    let olcumler;
+    try {
+      olcumler = karneOlcumleriniDogrula(anthropometric, motor_tests);
+    } catch (hata) {
+      return res.status(400).json({ mesaj: hata.message });
+    }
+
     try {
       // Sporcu gerçekten var mı?
       const sporcuSonuc = await pool.query(
@@ -434,8 +505,8 @@ app.post(
         [
           athlete_id,
           test_date,
-          JSON.stringify(anthropometric || {}),
-          JSON.stringify(motor_tests || {}),
+          JSON.stringify(olcumler.anthropometric),
+          JSON.stringify(olcumler.motor_tests),
           JSON.stringify(basic_swim || {}),
           JSON.stringify(freestyle || {}),
           JSON.stringify(backstroke || {}),
@@ -996,6 +1067,8 @@ app.post('/users', girisGerekli, sadeceAntrenor, async (req, res) => {
   }
 
   try {
+    const baglantiHatasi = await sporcuBaglantisiHatasi(athlete_id);
+    if (baglantiHatasi) return res.status(400).json({ mesaj: baglantiHatasi });
     const passwordHash = await bcrypt.hash(password, 10);
     const sonuc = await pool.query(
       'INSERT INTO users (email, password_hash, role, athlete_id) VALUES ($1, $2, $3, $4) RETURNING id, email, role, athlete_id',
@@ -1016,7 +1089,12 @@ app.post('/users', girisGerekli, sadeceAntrenor, async (req, res) => {
 app.patch('/users/:id/link-athlete', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { id } = req.params;
   const { athlete_id } = req.body;
+  if (!Object.prototype.hasOwnProperty.call(req.body, 'athlete_id')) {
+    return res.status(400).json({ mesaj: 'Sporcu seçimi veya açıkça null gönderilmeli' });
+  }
   try {
+    const baglantiHatasi = await sporcuBaglantisiHatasi(athlete_id);
+    if (baglantiHatasi) return res.status(400).json({ mesaj: baglantiHatasi });
     const sonuc = await pool.query(
       `UPDATE users SET athlete_id = $1 WHERE id = $2 AND role IN ('veli','sporcu') RETURNING id, email, role, athlete_id`,
       [athlete_id || null, id]

@@ -17,6 +17,8 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+require('./veli_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
+
 // E-posta gönderimi için SMTP bağlantısı. Bu 4 değeri kendi .env
 // dosyanıza eklemeniz gerekiyor: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS.
 // (Gmail kullanacaksanız normal şifreniz değil, "Uygulama Şifresi"
@@ -54,37 +56,7 @@ app.get('/', (req, res) => {
 
 // ---------------- KİMLİK DOĞRULAMA ----------------
 
-// Yeni kullanıcı kaydı (şimdilik herkes kayıt olabiliyor — ileride bunu
-// sadece antrenörün davet edebileceği bir sisteme çevirebiliriz)
-app.post('/auth/register', async (req, res) => {
-  const { email, password, role, athlete_id } = req.body;
-
-  if (!email || !password || !role) {
-    return res.status(400).json({ mesaj: 'E-posta, şifre ve rol zorunludur' });
-  }
-
-  try {
-    const baglantiHatasi = await sporcuBaglantisiHatasi(athlete_id);
-    if (baglantiHatasi) return res.status(400).json({ mesaj: baglantiHatasi });
-    // Şifreyi asla düz metin olarak saklamıyoruz — bcrypt ile "hash"liyoruz.
-    // Hash, şifreden geri döndürülemeyen, tek yönlü bir şifreleme işlemi.
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const sonuc = await pool.query(
-      'INSERT INTO users (email, password_hash, role, athlete_id) VALUES ($1, $2, $3, $4) RETURNING id, email, role, athlete_id',
-      [email, passwordHash, role, athlete_id || null]
-    );
-
-    res.status(201).json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    if (hata.code === '23505') {
-      // Postgres'in "unique constraint" hatası — bu e-posta zaten kayıtlı
-      return res.status(409).json({ mesaj: 'Bu e-posta zaten kayıtlı' });
-    }
-    res.status(500).json({ mesaj: 'Kayıt oluşturulamadı' });
-  }
-});
+// Veli kaydı veli_kayit.js içinde tanımlanır.
 
 // Giriş yapma
 app.post('/auth/login', async (req, res) => {
@@ -228,22 +200,6 @@ app.get('/athletes', girisGerekli, async (req, res) => {
 });
 // ---------------- KAYIT EKRANI SPORCULARI ----------------
 
-// Veli kayıt ekranında çocuk seçebilmek için kullanılır.
-// Bu endpoint giriş yapmadan da sadece sporcu ID ve isimlerini döndürür.
-app.get('/athletes/register-list', async (req, res) => {
-  try {
-    const sonuc = await pool.query(
-      'SELECT id, isim FROM athletes ORDER BY id ASC'
-    );
-
-    res.json(sonuc.rows);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({
-      mesaj: 'Kayıt için sporcular getirilemedi',
-    });
-  }
-}); 
 app.post('/athletes', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { isim, dogum_yili, grup, en_iyi_derece, en_iyi_derece_stil, dogum_tarihi, cinsiyet } = req.body;
   const hataMesaji = sporcuBilgisiHatasi(req.body);
@@ -1222,6 +1178,7 @@ app.post('/auth/reset-password', async (req, res) => {
     res.status(500).json({ mesaj: 'Hata: şifre güncellenemedi' });
   }
 });
+require('./sporcu_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
 
 app.listen(PORT, () => {
   console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);

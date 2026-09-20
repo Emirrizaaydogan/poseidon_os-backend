@@ -11,11 +11,29 @@ const app = express();
 const PORT = 3000;
 
 app.use(cors());
+app.use(
+  '/athletes/onboard',
+  girisGerekli,
+  sadeceAntrenor,
+  express.json({ limit: '3mb' })
+);
+
+app.use(
+  '/athletes/:id/private-profile',
+  girisGerekli,
+  sadeceAntrenor,
+  express.json({ limit: '3mb' })
+);
 app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+const sporcuOzelProfil = require('./sporcu_ozel_profil')(
+  app,
+  pool,
+  girisGerekli
+);
 
 require('./veli_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
 
@@ -1178,7 +1196,14 @@ app.post('/auth/reset-password', async (req, res) => {
     res.status(500).json({ mesaj: 'Hata: şifre güncellenemedi' });
   }
 });
-require('./sporcu_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
+require('./sporcu_kayit')(
+  app,
+  pool,
+  bcrypt,
+  girisGerekli,
+  sadeceAntrenor,
+  sporcuOzelProfil
+);
 
 app.listen(PORT, () => {
   console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);

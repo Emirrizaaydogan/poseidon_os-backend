@@ -48,7 +48,7 @@ module.exports = function veliKayitKur(app, pool, bcrypt, girisGerekli, sadeceAn
     try{if(req.user.role!=='veli')throw fail('Veli hesabı gerekli',403);res.json(await cocuklar(req.user.id));}catch(e){cevap(res,e);}
   });
   // Veli için kişisel ekranları seçilen çocukla sınırla.
-  for(const path of ['/dues','/attendance','/report-cards']){
+  for(const path of ['/dues','/report-cards']){
     app.get(path,girisGerekli,async(req,res,next)=>{
       if(req.user.role!=='veli')return next();
       try{
@@ -60,10 +60,6 @@ module.exports = function veliKayitKur(app, pool, bcrypt, girisGerekli, sadeceAn
         if(path==='/dues')sql='SELECT * FROM dues WHERE athlete_id=$1 ORDER BY id DESC';
         if(path==='/report-cards')sql=`SELECT rc.*,a.isim AS athlete_isim,a.dogum_yili,a.dogum_tarihi,a.cinsiyet,a.grup
           FROM report_cards rc JOIN athletes a ON a.id=rc.athlete_id WHERE rc.athlete_id=$1 ORDER BY rc.test_date DESC,rc.id DESC`;
-        if(path==='/attendance'){
-          sql='SELECT t.*,a.isim AS athlete_isim FROM attendance t JOIN athletes a ON a.id=t.athlete_id WHERE t.athlete_id=$1';
-          if(req.query.trainingId){params.push(idOku(req.query.trainingId));sql+=' AND t.training_id=$2';}sql+=' ORDER BY t.id';
-        }
         res.json((await pool.query(sql,params)).rows);
       }catch(e){cevap(res,e);}
     });

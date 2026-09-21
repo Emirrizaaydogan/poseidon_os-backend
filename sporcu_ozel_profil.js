@@ -249,10 +249,36 @@ module.exports = function sporcuOzelProfilKur(
   }
 
   function error(res, e) {
-    if (!e.status) {
-      console.error('Sporcu özel profil:', e.code || e.name);
-    }
+   if (!e.status) {
+  let mesaj = String(e.message || 'Hata açıklaması bulunamadı');
 
+  const gizliDegerler = [
+    process.env.SUPABASE_SECRET_KEY,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_URL,
+    process.env.DATABASE_URL,
+    process.env.JWT_SECRET,
+  ];
+
+  for (const deger of gizliDegerler) {
+    if (deger) {
+      mesaj = mesaj.split(deger).join('[GİZLENDİ]');
+    }
+  }
+
+  mesaj = mesaj
+    .replace(/sb_secret_[A-Za-z0-9_-]+/g, '[GİZLİ ANAHTAR]')
+    .replace(
+      /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+      '[GİZLİ TOKEN]'
+    );
+
+  console.error('Sporcu özel profil:', {
+    tur: e.name,
+    kod: e.code || null,
+    mesaj,
+  });
+}
     res.status(e.code === '23505' ? 409 : e.status || 500).json({
       mesaj:
         e.code === '23505'

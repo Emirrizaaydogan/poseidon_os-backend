@@ -34,7 +34,7 @@ const sporcuOzelProfil = require('./sporcu_ozel_profil')(
   pool,
   girisGerekli
 );
-
+require('./yoklama')(app, pool, girisGerekli);
 require('./veli_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
 
 // E-posta gönderimi için SMTP bağlantısı. Bu 4 değeri kendi .env
@@ -690,120 +690,6 @@ app.get('/report-cards/:id', girisGerekli, async (req, res) => {
     return res.status(500).json({
       mesaj: 'Karne getirilemedi',
     });
-  }
-});
-// ---------------- YOKLAMA (GİRİŞ / ÇIKIŞ) ----------------
-
-// Bir antrenmana ait yoklama kayıtlarını sporcu ismiyle birlikte getirir.
-// Antrenör hepsini görebilir; veli/sporcu sadece kendi sporcusununkini görür.
-app.get('/attendance', girisGerekli, async (req, res) => {
-  const { trainingId, athleteId } = req.query;
-
-  try {
-    let etkinAthleteId = athleteId;
-
-    if (req.user.role !== 'antrenor') {
-      const kullanici = await pool.query(
-        'SELECT athlete_id FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      const kendiSporcuId = kullanici.rows[0]?.athlete_id;
-
-      if (!kendiSporcuId) {
-        return res.status(403).json({
-          mesaj: 'Bu hesaba bağlı bir sporcu bulunamadı',
-        });
-      }
-      if (athleteId && parseInt(athleteId) !== parseInt(kendiSporcuId)) {
-        return res.status(403).json({
-          mesaj: 'Bu sporcunun yoklama bilgilerine erişemezsin',
-        });
-      }
-      etkinAthleteId = kendiSporcuId;
-    }
-
-    let sorgu = `
-      SELECT a.*, at.isim AS athlete_isim
-      FROM attendance a
-      JOIN athletes at ON at.id = a.athlete_id
-      WHERE 1=1
-    `;
-    const parametreler = [];
-
-    if (trainingId) {
-      parametreler.push(trainingId);
-      sorgu += ` AND a.training_id = $${parametreler.length}`;
-    }
-    if (etkinAthleteId) {
-      parametreler.push(etkinAthleteId);
-      sorgu += ` AND a.athlete_id = $${parametreler.length}`;
-    }
-    sorgu += ' ORDER BY a.id ASC';
-
-    const sonuc = await pool.query(sorgu, parametreler);
-    res.json(sonuc.rows);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: yoklama kayıtları getirilemedi' });
-  }
-});
-
-// Sporcu QR kodu okuttuğunda çağrılır. 'tip' 'giris' ya da 'cikis' olur.
-// Her (antrenman, sporcu) çifti için tek satır tutulur: önce giriş_zamani,
-// sonra çıkış_zamanı doldurulur — böylece veli tek kayıtta hem "girdi"
-// hem "çıktı" bilgisini görebilir.
-app.post('/attendance', girisGerekli, async (req, res) => {
-  const { training_id, athlete_id, tip } = req.body;
-
-  if (!training_id || !athlete_id || !tip) {
-    return res.status(400).json({
-      mesaj: 'training_id, athlete_id ve tip zorunludur',
-    });
-  }
-  if (!['giris', 'cikis'].includes(tip)) {
-    return res.status(400).json({ mesaj: "tip 'giris' ya da 'cikis' olmalı" });
-  }
-
-  try {
-    const mevcut = await pool.query(
-      'SELECT * FROM attendance WHERE training_id = $1 AND athlete_id = $2',
-      [training_id, athlete_id]
-    );
-
-    if (tip === 'giris') {
-      if (mevcut.rows.length > 0 && mevcut.rows[0].giris_zamani) {
-        return res.status(409).json({ mesaj: 'Bu sporcu zaten giriş yaptı' });
-      }
-      if (mevcut.rows.length > 0) {
-        const sonuc = await pool.query(
-          'UPDATE attendance SET giris_zamani = now() WHERE id = $1 RETURNING *',
-          [mevcut.rows[0].id]
-        );
-        return res.json(sonuc.rows[0]);
-      }
-      const sonuc = await pool.query(
-        `INSERT INTO attendance (training_id, athlete_id, giris_zamani)
-         VALUES ($1, $2, now()) RETURNING *`,
-        [training_id, athlete_id]
-      );
-      return res.status(201).json(sonuc.rows[0]);
-    }
-
-    // tip === 'cikis'
-    if (mevcut.rows.length === 0 || !mevcut.rows[0].giris_zamani) {
-      return res.status(400).json({ mesaj: 'Önce giriş yapman gerekiyor' });
-    }
-    if (mevcut.rows[0].cikis_zamani) {
-      return res.status(409).json({ mesaj: 'Bu sporcu zaten çıkış yaptı' });
-    }
-    const sonuc = await pool.query(
-      'UPDATE attendance SET cikis_zamani = now() WHERE id = $1 RETURNING *',
-      [mevcut.rows[0].id]
-    );
-    res.json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: yoklama kaydedilemedi' });
   }
 });
 

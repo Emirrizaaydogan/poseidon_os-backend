@@ -35,6 +35,7 @@ const sporcuOzelProfil = require('./sporcu_ozel_profil')(
   girisGerekli
 );
 require('./yoklama')(app, pool, girisGerekli);
+require('./takvim')(app, pool, girisGerekli); 
 require('./veli_kayit')(app, pool, bcrypt, girisGerekli, sadeceAntrenor);
 
 // E-posta gönderimi için SMTP bağlantısı. Bu 4 değeri kendi .env
@@ -273,17 +274,93 @@ app.delete('/athletes/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
 });
 
 // ---------------- ANTRENMANLAR ----------------
-
 app.get('/trainings', girisGerekli, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+
   try {
-    const sonuc = await pool.query('SELECT * FROM trainings ORDER BY id ASC');
-    res.json(sonuc.rows);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: antrenmanlar getirilemedi' });
+    // Rolü güncel kullanıcı kaydından kontrol et.
+    const userResult = await pool.query(
+      'SELECT role FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    const role = userResult.rows[0]?.role;
+
+    if (!role) {
+      return res.status(401).json({
+        mesaj: 'Oturum geçersiz'
+      });
+    }
+
+    if (role === 'veli') {
+      return res.status(403).json({
+        mesaj: 'Veliler antrenman içeriklerine erişemez.'
+      });
+    }
+
+    if (!['antrenor', 'sporcu'].includes(role)) {
+      return res.status(403).json({
+        mesaj: 'Bu işlem için yetkin yok.'
+      });
+    }
+
+    const sonuc = await pool.query(
+      'SELECT * FROM trainings ORDER BY id ASC'
+    );
+
+    if (role === 'antrenor') {
+      return res.json(sonuc.rows);
+    }
+
+    // Türkiye tarihine göre bugün ve dün.
+    const tarih = await pool.query(`
+      SELECT
+        to_char(
+          now() AT TIME ZONE 'Europe/Istanbul',
+          'YYYY-MM-DD'
+        ) AS bugun,
+        to_char(
+          (now() AT TIME ZONE 'Europe/Istanbul') - interval '1 day',
+          'YYYY-MM-DD'
+        ) AS dun
+    `);
+
+    const { bugun, dun } = tarih.rows[0];
+
+    function tarihAnahtari(value) {
+      const text = String(value || '').trim();
+
+      // Yeni kayıtlar: 2026-09-23
+      let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+
+      if (m) {
+        return `${m[1]}-${m[2]}-${m[3]}`;
+      }
+
+      // Eski kayıtlar: 23.09.2026 veya 3.9.2026
+      m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(text);
+
+      if (m) {
+        return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+      }
+
+      return null;
+    }
+
+    const izinliAntrenmanlar = sonuc.rows.filter(antrenman => {
+      const gun = tarihAnahtari(antrenman.tarih);
+      return gun === bugun || gun === dun;
+    });
+
+    return res.json(izinliAntrenmanlar);
+  } catch (e) {
+    console.error('Antrenman listesi:', e.code || e.name);
+
+    return res.status(500).json({
+      mesaj: 'Antrenmanlar getirilemedi'
+    });
   }
 });
-
 app.post('/trainings', girisGerekli, sadeceAntrenor, async (req, res) => {
   const { baslik, tarih, havuz, sure, setler } = req.body;
   try {

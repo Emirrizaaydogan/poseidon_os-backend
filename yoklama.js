@@ -144,7 +144,11 @@ module.exports = function yoklamaKur(app, pool, girisGerekli) {
          LIMIT 50`,
         [a]
       );
-
+if (u.role !== 'antrenor') {
+  for (const kayit of r.rows) {
+    delete kayit.training_baslik;
+  }
+}
       res.json(r.rows);
     } catch (e) {
       cevap(res, e);

@@ -124,18 +124,49 @@ app.post('/auth/login', async (req, res) => {
 
 // Bu fonksiyon, gelen her isteğin başında "Authorization: Bearer <token>"
 // başlığını kontrol ediyor. Token yoksa ya da geçersizse isteği reddediyor.
-function girisGerekli(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ mesaj: 'Bu işlem için giriş yapmalısın' });
+async function girisGerekli(req, res, next) {
+  const header = req.headers.authorization;
+
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ mesaj: 'Giriş yapmalısın' });
   }
-  const token = authHeader.split(' ')[1];
+
+  let payload;
+
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = payload; // { id, role } — sonraki fonksiyonlar bunu kullanabilir
-    next(); // her şey yolunda, isteğe devam et
-  } catch (hata) {
-    return res.status(401).json({ mesaj: 'Oturumun geçersiz veya süresi dolmuş, tekrar giriş yap' });
+    payload = jwt.verify(header.slice(7), process.env.JWT_SECRET);
+
+    if (
+      !payload ||
+      !Number.isSafeInteger(Number(payload.id)) ||
+      Number(payload.id) < 1
+    ) {
+      throw new Error('Geçersiz kullanıcı');
+    }
+  } catch (_) {
+    return res.status(401).json({
+      mesaj: 'Oturum geçersiz, tekrar giriş yap'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT id, role, athlete_id FROM users WHERE id = $1',
+      [payload.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(401).json({
+        mesaj: 'Hesap artık mevcut değil'
+      });
+    }
+
+    req.user = result.rows[0];
+    return next();
+  } catch (e) {
+    return res.status(503).json({
+      mesaj: 'Oturum kontrol edilemedi'
+    });
   }
 }
 
@@ -273,47 +304,49 @@ app.delete('/athletes/:id', girisGerekli, sadeceAntrenor, async (req, res) => {
   }
 });
 
-// ---------------- ANTRENMANLAR ----------------
+// ---------------- ANTRENMANLAR ---------------//
+const KULUP_GRUPLARI = [
+  'Performans Grubu',
+  'Alt Yapı Grubu',
+  'Gelişim Grubu'
+];
+
 app.get('/trainings', girisGerekli, async (req, res) => {
   res.set('Cache-Control', 'no-store');
 
   try {
-    // Rolü güncel kullanıcı kaydından kontrol et.
-    const userResult = await pool.query(
-      'SELECT role FROM users WHERE id = $1',
+    const { rows } = await pool.query(
+      `SELECT u.role, a.grup
+       FROM users u
+       LEFT JOIN athletes a ON a.id = u.athlete_id
+       WHERE u.id = $1`,
       [req.user.id]
     );
 
-    const role = userResult.rows[0]?.role;
+    const user = rows[0];
 
-    if (!role) {
-      return res.status(401).json({
-        mesaj: 'Oturum geçersiz'
-      });
+    if (!user) {
+      return res.status(401).json({ mesaj: 'Oturum geçersiz' });
     }
 
-    if (role === 'veli') {
+    if (user.role === 'antrenor') {
+      const result = await pool.query(
+        'SELECT * FROM trainings ORDER BY id DESC'
+      );
+      return res.json(result.rows);
+    }
+
+    if (user.role !== 'sporcu') {
       return res.status(403).json({
-        mesaj: 'Veliler antrenman içeriklerine erişemez.'
+        mesaj: 'Antrenman içeriklerine erişimin yok'
       });
     }
 
-    if (!['antrenor', 'sporcu'].includes(role)) {
-      return res.status(403).json({
-        mesaj: 'Bu işlem için yetkin yok.'
-      });
+    if (!KULUP_GRUPLARI.includes(user.grup)) {
+      return res.json([]);
     }
 
-    const sonuc = await pool.query(
-      'SELECT * FROM trainings ORDER BY id ASC'
-    );
-
-    if (role === 'antrenor') {
-      return res.json(sonuc.rows);
-    }
-
-    // Türkiye tarihine göre bugün ve dün.
-    const tarih = await pool.query(`
+    const dates = await pool.query(`
       SELECT
         to_char(
           now() AT TIME ZONE 'Europe/Istanbul',
@@ -325,56 +358,102 @@ app.get('/trainings', girisGerekli, async (req, res) => {
         ) AS dun
     `);
 
-    const { bugun, dun } = tarih.rows[0];
+    const { bugun, dun } = dates.rows[0];
 
-    function tarihAnahtari(value) {
-      const text = String(value || '').trim();
+    const result = await pool.query(
+      'SELECT * FROM trainings WHERE grup = $1 ORDER BY id DESC',
+      [user.grup]
+    );
 
-      // Yeni kayıtlar: 2026-09-23
-      let m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    return res.json(result.rows.filter(t => {
+      let gun = String(t.tarih || '').trim();
 
-      if (m) {
-        return `${m[1]}-${m[2]}-${m[3]}`;
+      const eski = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(gun);
+
+      if (eski) {
+        gun =
+          `${eski[3]}-` +
+          `${eski[2].padStart(2, '0')}-` +
+          `${eski[1].padStart(2, '0')}`;
       }
 
-      // Eski kayıtlar: 23.09.2026 veya 3.9.2026
-      m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(text);
-
-      if (m) {
-        return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-      }
-
-      return null;
-    }
-
-    const izinliAntrenmanlar = sonuc.rows.filter(antrenman => {
-      const gun = tarihAnahtari(antrenman.tarih);
       return gun === bugun || gun === dun;
-    });
-
-    return res.json(izinliAntrenmanlar);
+    }));
   } catch (e) {
     console.error('Antrenman listesi:', e.code || e.name);
 
-    return res.status(500).json({
+    res.status(500).json({
       mesaj: 'Antrenmanlar getirilemedi'
     });
   }
 });
-app.post('/trainings', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const { baslik, tarih, havuz, sure, setler } = req.body;
-  try {
-    const sonuc = await pool.query(
-      'INSERT INTO trainings (baslik, tarih, havuz, sure, setler) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [baslik, tarih, havuz, sure, JSON.stringify(setler || [])]
-    );
-    res.status(201).json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: antrenman eklenemedi' });
-  }
-});
 
+app.post(
+  '/trainings',
+  girisGerekli,
+  sadeceAntrenor,
+  async (req, res) => {
+    const {
+      baslik,
+      tarih,
+      havuz,
+      sure,
+      setler,
+      grup
+    } = req.body || {};
+
+    if (!KULUP_GRUPLARI.includes(grup)) {
+      return res.status(400).json({
+        mesaj: 'Üç kulüp grubundan birini seçmelisin'
+      });
+    }
+
+    const date =
+      typeof tarih === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(tarih)
+        ? new Date(tarih + 'T00:00:00Z')
+        : null;
+
+    if (
+      typeof baslik !== 'string' ||
+      !baslik.trim() ||
+      !date ||
+      Number.isNaN(date.getTime()) ||
+      date.toISOString().slice(0, 10) !== tarih ||
+      !Array.isArray(setler)
+    ) {
+      return res.status(400).json({
+        mesaj: 'Başlık, tarih veya setler geçersiz'
+      });
+    }
+
+    try {
+      const result = await pool.query(
+        `INSERT INTO trainings (
+           baslik, tarih, havuz, sure, setler, grup
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [
+          baslik.trim(),
+          tarih,
+          havuz,
+          sure,
+          JSON.stringify(setler),
+          grup
+        ]
+      );
+
+      res.status(201).json(result.rows[0]);
+    } catch (e) {
+      console.error('Antrenman kaydı:', e.code || e.name);
+
+      res.status(500).json({
+        mesaj: 'Antrenman eklenemedi'
+      });
+    }
+  }
+);
 // ---------------- PERFORMANS ----------------
 
 // ?athleteId=5 gibi bir sorguyla o sporcuya ait kayıtları filtreleyebiliyoruz

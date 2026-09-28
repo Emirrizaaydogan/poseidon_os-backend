@@ -98,7 +98,7 @@ module.exports = function yoklamaKur(app, pool, girisGerekli) {
 
       if (t !== null) {
         const training = await pool.query(
-          'SELECT id FROM trainings WHERE id = $1',
+          'SELECT id, grup FROM trainings WHERE id = $1',
           [t]
         );
 
@@ -120,8 +120,9 @@ module.exports = function yoklamaKur(app, pool, girisGerekli) {
              ON y.athlete_id = s.id
             AND y.training_id = $1
            WHERE ($2::bigint IS NULL OR s.id = $2)
-           ORDER BY s.isim, s.id`,
-          [t, a]
+             AND s.grup = $3
+             ORDER BY s.isim, s.id`,
+               [t, a, training.rows[0].grup]
         );
 
         return res.json(r.rows);
@@ -180,7 +181,7 @@ if (u.role !== 'antrenor') {
       }
 
       const training = await c.query(
-        'SELECT id FROM trainings WHERE id = $1 FOR SHARE',
+        'SELECT id, grup FROM trainings WHERE id = $1 FOR SHARE',
         [t]
       );
 
@@ -189,14 +190,22 @@ if (u.role !== 'antrenor') {
       }
 
       const athlete = await c.query(
-        'SELECT id FROM athletes WHERE id = $1 FOR SHARE',
+        'SELECT id, grup FROM athletes WHERE id = $1 FOR SHARE',
         [a]
       );
 
       if (!athlete.rows.length) {
         throw hata('Sporcu bulunamadı', 404);
       }
-
+      if (
+       !training.rows[0].grup ||
+      training.rows[0].grup !== athlete.rows[0].grup
+     ) {
+      throw hata(
+      'Bu sporcu antrenmanın grubunda değil',
+      403
+     );
+}
       // Aynı çocuk/antrenman için işlemleri sıraya alır.
       await c.query(
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',

@@ -6,9 +6,10 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const path = require('path');
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 app.use(cors());
 app.use(
@@ -24,11 +25,28 @@ app.use(
   sadeceAntrenor,
   express.json({ limit: '3mb' })
 );
+// Büyük dekont gövdesini yalnızca doğrulanmış veli isteğinde ayrıştır.
+app.use(
+  '/dues/:id/receipt',
+  girisGerekli,
+  (req, res, next) => {
+    if (req.method === 'POST' && req.user.role !== 'veli') {
+      return res.status(403).json({
+        mesaj: 'Veli hesabı gerekli',
+      });
+    }
+
+    next();
+  },
+  express.json({ limit: '7mb' })
+);
+
 app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+require('./veli_onay')(app, pool, bcrypt, girisGerekli);
 const sporcuOzelProfil = require('./sporcu_ozel_profil')(
   app,
   pool,
@@ -69,8 +87,30 @@ async function sifreSifirlamaKoduGonder(email, kod) {
   });
 }
 
+// Sunucunun çalıştığını kontrol etmek için.
+app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+
+  res.json({
+    durum: 'ok',
+    uygulama: 'Poseidon OS',
+  });
+});
+
+// Derlenmiş Flutter web dosyaları.
+const webKlasoru = path.join(__dirname, 'public');
+
+app.use(
+  express.static(webKlasoru, {
+    index: false,
+    maxAge: 0,
+  })
+);
+
+// Ana adres Flutter giriş ekranını açar.
 app.get('/', (req, res) => {
-  res.send('Poseidon OS Backend çalışıyor! 🌊');
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(webKlasoru, 'index.html'));
 });
 
 // ---------------- KİMLİK DOĞRULAMA ----------------
@@ -848,208 +888,708 @@ app.get('/report-cards/:id', girisGerekli, async (req, res) => {
     });
   }
 });
+// ---------------- AİDAT VE DEKONT ----------------
 
-// ---------------- AİDAT ----------------
+const { createClient } = require('@supabase/supabase-js');
 
+const DEKONT_BUCKET = 'aidat-dekontlari';
+const DEKONT_MAX = 5 * 1024 * 1024;
+
+let dekontStorage;
+
+function aidatHata(mesaj, status = 400) {
+  return Object.assign(new Error(mesaj), { status });
+}
+
+function aidatCevap(res, hata) {
+  if (!hata.status) {
+    console.error('Aidat işlemi başarısız:', hata.code || hata.name);
+  }
+
+  return res.status(hata.status || 500).json({
+    mesaj: hata.status
+      ? hata.message
+      : 'Aidat işlemi tamamlanamadı',
+  });
+}
+
+function aidatIdOku(deger) {
+  if (!/^\d+$/.test(String(deger))) {
+    throw aidatHata('Geçerli kayıt seç');
+  }
+
+  const id = Number(deger);
+
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw aidatHata('Geçerli kayıt seç');
+  }
+
+  return id;
+}
+
+function aidatAy(deger) {
+  if (
+    typeof deger !== 'string' ||
+    !/^\d{4}-(0[1-9]|1[0-2])$/.test(deger)
+  ) {
+    throw aidatHata('Ay YYYY-AA biçiminde olmalı');
+  }
+
+  return deger;
+}
+
+function aidatTarih(deger) {
+  if (
+    typeof deger !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(deger)
+  ) {
+    throw aidatHata('Geçerli tarih gir');
+  }
+
+  const tarih = new Date(deger + 'T00:00:00Z');
+
+  if (
+    !Number.isFinite(tarih.getTime()) ||
+    tarih.toISOString().slice(0, 10) !== deger
+  ) {
+    throw aidatHata('Geçerli tarih gir');
+  }
+
+  return deger;
+}
+
+function storageAl() {
+  if (
+    !process.env.SUPABASE_URL ||
+    !process.env.SUPABASE_SERVICE_ROLE_KEY
+  ) {
+    throw aidatHata(
+      'Sunucunun dekont depolama ayarları eksik',
+      503
+    );
+  }
+
+  if (!dekontStorage) {
+    const supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+        global: {
+          fetch: (url, options = {}) =>
+            fetch(url, {
+              ...options,
+              signal: AbortSignal.timeout(30000),
+            }),
+        },
+      }
+    );
+
+    dekontStorage = supabase.storage.from(DEKONT_BUCKET);
+  }
+
+  return dekontStorage;
+}
+
+// Çoklu çocuk bağlantısını ve eski tekli bağlantıyı destekler.
+const veliBaglantisi = `
+  EXISTS (
+    SELECT 1
+    FROM parent_athletes pa
+    WHERE pa.parent_id = $1
+      AND pa.athlete_id = d.athlete_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM users u
+    WHERE u.id = $1
+      AND u.role = 'veli'
+      AND u.athlete_id = d.athlete_id
+  )
+`;
+
+async function aidatYetkiliMi(veritabani, kullanici, aidat) {
+  if (kullanici.role === 'antrenor') return;
+
+  if (kullanici.role !== 'veli') {
+    throw aidatHata('Aidat erişim yetkin yok', 403);
+  }
+
+  const sonuc = await veritabani.query(
+    `
+      SELECT d.id
+      FROM dues d
+      WHERE d.id = $2
+        AND (${veliBaglantisi})
+    `,
+    [kullanici.id, aidat.id]
+  );
+
+  if (!sonuc.rows.length) {
+    throw aidatHata('Bu aidata erişemezsin', 403);
+  }
+}
+
+function dekontOku(veri) {
+  const ad = veri?.dosya_adi;
+  const kod = veri?.base64;
+
+  if (
+    typeof ad !== 'string' ||
+    ad.length < 1 ||
+    ad.length > 180 ||
+    /[\x00-\x1f\/\\]/.test(ad)
+  ) {
+    throw aidatHata('Geçerli dosya adı gerekli');
+  }
+
+  if (
+    typeof kod !== 'string' ||
+    kod.length > Math.ceil(DEKONT_MAX / 3) * 4 ||
+    kod.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(kod)
+  ) {
+    throw aidatHata('Geçerli, en fazla 5 MB dosya gönder');
+  }
+
+  const bytes = Buffer.from(kod, 'base64');
+
+  if (
+    !bytes.length ||
+    bytes.length > DEKONT_MAX ||
+    bytes.toString('base64') !== kod
+  ) {
+    throw aidatHata('Geçerli, en fazla 5 MB dosya gönder');
+  }
+
+  const ext = ad.split('.').pop().toLowerCase();
+
+  const png = bytes.subarray(0, 8).equals(
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+  );
+
+  const jpg =
+    bytes[0] === 255 &&
+    bytes[1] === 216 &&
+    bytes[2] === 255;
+
+  const pdf = bytes.subarray(0, 5).toString() === '%PDF-';
+
+  let type = null;
+
+  if (ext === 'png' && png) {
+    type = 'image/png';
+  } else if (['jpg', 'jpeg'].includes(ext) && jpg) {
+    type = 'image/jpeg';
+  } else if (ext === 'pdf' && pdf) {
+    type = 'application/pdf';
+  }
+
+  if (!type) {
+    throw aidatHata(
+      'Yalnızca PDF, JPG veya PNG dekont yüklenebilir'
+    );
+  }
+
+  return { ad, bytes, type, ext };
+}
+
+// Aidatları listele.
 app.get('/dues', girisGerekli, async (req, res) => {
-  const { athleteId } = req.query;
+  res.set('Cache-Control', 'no-store');
 
   try {
-    let sonuc;
-
-    // ANTRENÖR
-    // Antrenör bütün aidatları görebilir.
-    if (req.user.role === 'antrenor') {
-      if (athleteId) {
-        sonuc = await pool.query(
-          `
-          SELECT *
-          FROM dues
-          WHERE athlete_id = $1
-          ORDER BY id DESC
-          `,
-          [athleteId]
-        );
-      } else {
-        sonuc = await pool.query(
-          `
-          SELECT *
-          FROM dues
-          ORDER BY id DESC
-          `
-        );
-      }
-
-      return res.json(sonuc.rows);
+    if (!['antrenor', 'veli'].includes(req.user.role)) {
+      throw aidatHata('Aidat erişim yetkin yok', 403);
     }
 
-    // VELİ
-    // Veli sadece kendi çocuğunun aidatlarını görebilir.
+    const secim =
+      req.query.athleteId ??
+      (req.user.role === 'veli'
+        ? req.headers['x-athlete-id']
+        : undefined);
+
+    const id =
+      secim === undefined ? null : aidatIdOku(secim);
+
+    let sonuc;
+
     if (req.user.role === 'veli') {
-      const kullanici = await pool.query(
-        `
-        SELECT athlete_id
-        FROM users
-        WHERE id = $1
-        `,
-        [req.user.id]
-      );
+      if (id !== null) {
+        const baglanti = await pool.query(
+          `
+            SELECT a.id
+            FROM athletes a
+            WHERE a.id = $2
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM parent_athletes pa
+                  WHERE pa.parent_id = $1
+                    AND pa.athlete_id = a.id
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM users u
+                  WHERE u.id = $1
+                    AND u.role = 'veli'
+                    AND u.athlete_id = a.id
+                )
+              )
+          `,
+          [req.user.id, id]
+        );
 
-      const veliSporcuId = kullanici.rows[0]?.athlete_id;
-
-      if (!veliSporcuId) {
-        return res.status(403).json({
-          mesaj: 'Bu veli hesabına bağlı sporcu bulunamadı'
-        });
-      }
-
-      // Veli başka bir sporcunun ID'sini göndermeye çalışırsa engelle.
-      if (
-        athleteId &&
-        parseInt(athleteId) !== parseInt(veliSporcuId)
-      ) {
-        return res.status(403).json({
-          mesaj: 'Bu sporcunun aidat bilgilerine erişemezsin'
-        });
+        if (!baglanti.rows.length) {
+          throw aidatHata('Bu çocuğa erişemezsin', 403);
+        }
       }
 
       sonuc = await pool.query(
         `
-        SELECT *
-        FROM dues
-        WHERE athlete_id = $1
-        ORDER BY id DESC
+          SELECT d.*, a.isim AS athlete_isim
+          FROM dues d
+          JOIN athletes a ON a.id = d.athlete_id
+          WHERE (${veliBaglantisi})
+            AND (
+              $2::integer IS NULL
+              OR d.athlete_id = $2
+            )
+          ORDER BY d.ay DESC, d.id DESC
         `,
-        [veliSporcuId]
+        [req.user.id, id]
       );
-
-      return res.json(sonuc.rows);
+    } else {
+      sonuc = await pool.query(
+        `
+          SELECT d.*, a.isim AS athlete_isim
+          FROM dues d
+          JOIN athletes a ON a.id = d.athlete_id
+          WHERE (
+            $1::integer IS NULL
+            OR d.athlete_id = $1
+          )
+          ORDER BY d.ay DESC, d.id DESC
+        `,
+        [id]
+      );
     }
 
-    return res.status(403).json({
-      mesaj: 'Aidat bilgilerine erişim yetkin yok'
-    });
-
+    res.json(
+      sonuc.rows.map(
+        ({
+          dekont_path,
+          dekont_yukleyen_id,
+          onaylayan_id,
+          ...aidat
+        }) => ({
+          ...aidat,
+          dekont_var: Boolean(dekont_path),
+          durum: aidat.odendi
+            ? 'odendi'
+            : aidat.dekont_durum || 'bekleniyor',
+        })
+      )
+    );
   } catch (hata) {
-    console.error(hata);
-
-    res.status(500).json({
-      mesaj: 'Hata: aidat kayıtları getirilemedi'
-    });
+    aidatCevap(res, hata);
   }
 });
-// ---------------- AİDAT SON ÖDEME TARİHİ ----------------
 
-// Antrenör, belirlenen ayın aidatlarının son ödeme tarihini günceller.
+// Son ödeme tarihini değiştir.
 app.patch(
   '/dues/deadline',
   girisGerekli,
   sadeceAntrenor,
   async (req, res) => {
-    const { tarih, ay } = req.body;
-
-    if (!tarih) {
-      return res.status(400).json({
-        mesaj: 'Son ödeme tarihi zorunludur',
-      });
-    }
-
-    if (!ay) {
-      return res.status(400).json({
-        mesaj: 'Aidat ayı zorunludur',
-      });
-    }
-
     try {
+      const tarih = aidatTarih(req.body?.tarih);
+      const ay = aidatAy(req.body?.ay);
+
       const sonuc = await pool.query(
         `
-        UPDATE dues
-        SET son_odeme_tarihi = $1
-        WHERE ay = $2
-        RETURNING *
+          UPDATE dues
+          SET son_odeme_tarihi = $1
+          WHERE ay = $2
+          RETURNING id
         `,
         [tarih, ay]
       );
 
-      return res.json({
+      res.json({
         mesaj: 'Son ödeme tarihi güncellendi',
         guncellenen_sayi: sonuc.rows.length,
-        aidatlar: sonuc.rows,
       });
     } catch (hata) {
-      console.error(hata);
-
-      return res.status(500).json({
-        mesaj: 'Son ödeme tarihi güncellenemedi',
-      });
+      aidatCevap(res, hata);
     }
   }
 );
-//-------------Aidat Ekleme-----------------
-app.post('/dues', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const {   athlete_id, ay, tutar, son_odeme_tarihi } = req.body;
-  try {
-    const sonuc = await pool.query(
-      'INSERT INTO dues (athlete_id, ay, tutar, son_odeme_tarihi, odendi) VALUES ($1, $2, $3, $4, false) RETURNING *',
-      [athlete_id, ay, tutar, son_odeme_tarihi]
-    );
-    res.status(201).json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: aidat kaydı eklenemedi' });
+
+// Aidat oluştur.
+app.post(
+  '/dues',
+  girisGerekli,
+  sadeceAntrenor,
+  async (req, res) => {
+    let client;
+
+    try {
+      const veri = req.body || {};
+      const id = aidatIdOku(veri.athlete_id);
+      const ay = aidatAy(veri.ay);
+      const tarih = aidatTarih(veri.son_odeme_tarihi);
+
+      if (
+        !['string', 'number'].includes(typeof veri.tutar) ||
+        !Number.isFinite(Number(veri.tutar)) ||
+        Number(veri.tutar) <= 0
+      ) {
+        throw aidatHata('Tutar sıfırdan büyük olmalı');
+      }
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+
+      await client.query(
+        'SELECT pg_advisory_xact_lock($1, $2)',
+        [id, Number(ay.replace('-', ''))]
+      );
+
+      const eski = await client.query(
+        'SELECT id FROM dues WHERE athlete_id=$1 AND ay=$2',
+        [id, ay]
+      );
+
+      if (eski.rows.length) {
+        throw aidatHata('Bu ay için aidat zaten var', 409);
+      }
+
+      const sonuc = await client.query(
+        `
+          INSERT INTO dues (
+            athlete_id, ay, tutar,
+            son_odeme_tarihi, odendi
+          )
+          VALUES ($1, $2, $3, $4, false)
+          RETURNING id
+        `,
+        [id, ay, veri.tutar, tarih]
+      );
+
+      await client.query('COMMIT');
+      res.status(201).json(sonuc.rows[0]);
+    } catch (hata) {
+      if (client) {
+        await client.query('ROLLBACK').catch(() => {});
+      }
+
+      aidatCevap(res, hata);
+    } finally {
+      client?.release();
+    }
   }
-});
-// ---------------- AİDAT SON ÖDEME TARİHİ ----------------
+);
 
-// Antrenör, mevcut ayın aidatlarının son ödeme tarihini belirler.
-app.patch('/dues/deadline', girisGerekli, sadeceAntrenor, async (req, res) => {
-  const { tarih, ay } = req.body;
+// Veli dekont gönderir.
+app.post(
+  '/dues/:id/receipt',
+  girisGerekli,
+  async (req, res) => {
+    let client;
+    let yeniPath;
+    let storage;
+    let committed = false;
 
-  if (!tarih) {
-    return res.status(400).json({
-      mesaj: 'Son ödeme tarihi zorunludur'
-    });
+    try {
+      if (req.user.role !== 'veli') {
+        throw aidatHata(
+          'Dekontu yalnızca veli gönderebilir',
+          403
+        );
+      }
+
+      const id = aidatIdOku(req.params.id);
+      const dosya = dekontOku(req.body);
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+
+      const sonuc = await client.query(
+        'SELECT * FROM dues WHERE id=$1 FOR UPDATE',
+        [id]
+      );
+
+      if (!sonuc.rows.length) {
+        throw aidatHata('Aidat bulunamadı', 404);
+      }
+
+      const aidat = sonuc.rows[0];
+
+      await aidatYetkiliMi(client, req.user, aidat);
+
+      if (
+        aidat.odendi ||
+        aidat.dekont_durum === 'onay_bekliyor'
+      ) {
+        throw aidatHata(
+          'Ödenmiş veya onay bekleyen aidata tekrar dekont yüklenemez',
+          409
+        );
+      }
+
+      storage = storageAl();
+
+      yeniPath =
+        `${aidat.athlete_id}/${id}/` +
+        `${crypto.randomUUID()}.${dosya.ext}`;
+
+      const yukleme = await storage.upload(
+        yeniPath,
+        dosya.bytes,
+        {
+          contentType: dosya.type,
+          upsert: false,
+          cacheControl: '0',
+        }
+      );
+
+      if (yukleme.error) {
+        throw aidatHata(
+          'Dekont depolanamadı. Depolama ayarlarını kontrol et.',
+          503
+        );
+      }
+
+      await client.query(
+        `
+          UPDATE dues
+          SET dekont_path = $2,
+              dekont_adi = $3,
+              dekont_mime = $4,
+              dekont_boyut = $5,
+              dekont_yukleyen_id = $6,
+              dekont_yukleme_tarihi = now(),
+              dekont_durum = 'onay_bekliyor',
+              dekont_ret_nedeni = NULL,
+              onaylayan_id = NULL,
+              onay_tarihi = NULL
+          WHERE id = $1
+        `,
+        [
+          id,
+          yeniPath,
+          dosya.ad,
+          dosya.type,
+          dosya.bytes.length,
+          req.user.id,
+        ]
+      );
+
+      await client.query('COMMIT');
+      committed = true;
+
+      if (aidat.dekont_path) {
+        await storage
+          .remove([aidat.dekont_path])
+          .catch(() => {});
+      }
+
+      res.status(201).json({
+        mesaj: 'Dekont gönderildi, antrenör onayı bekleniyor',
+      });
+    } catch (hata) {
+      if (client && !committed) {
+        await client.query('ROLLBACK').catch(() => {});
+      }
+
+      if (yeniPath && storage && !committed) {
+        try {
+          const baglanti = await client.query(
+            'SELECT id FROM dues WHERE dekont_path=$1',
+            [yeniPath]
+          );
+
+          if (!baglanti.rows.length) {
+            await storage.remove([yeniPath]);
+          }
+        } catch (_) {}
+      }
+
+      aidatCevap(res, hata);
+    } finally {
+      client?.release();
+    }
   }
+);
 
-  try {
-    const sonuc = await pool.query(
-      `
-      UPDATE dues
-      SET son_odeme_tarihi = $1
-      WHERE ay = $2
-      RETURNING *
-      `,
-      [tarih, ay]
-    );
+// Yetkili kullanıcı için iki dakikalık dekont bağlantısı.
+app.get(
+  '/dues/:id/receipt',
+  girisGerekli,
+  async (req, res) => {
+    res.set('Cache-Control', 'no-store');
 
-    res.json({
-      mesaj: 'Son ödeme tarihi güncellendi',
-      guncellenen_sayi: sonuc.rows.length,
-      aidatlar: sonuc.rows,
-    });
-  } catch (hata) {
-    console.error(hata);
+    try {
+      const id = aidatIdOku(req.params.id);
 
-    res.status(500).json({
-      mesaj: 'Son ödeme tarihi güncellenemedi'
-    });
+      const sonuc = await pool.query(
+        'SELECT * FROM dues WHERE id=$1',
+        [id]
+      );
+
+      if (!sonuc.rows.length) {
+        throw aidatHata('Aidat bulunamadı', 404);
+      }
+
+      const aidat = sonuc.rows[0];
+
+      await aidatYetkiliMi(pool, req.user, aidat);
+
+      if (!aidat.dekont_path) {
+        throw aidatHata('Dekont bulunamadı', 404);
+      }
+
+      const { data, error } = await storageAl()
+        .createSignedUrl(aidat.dekont_path, 120);
+
+      if (error || !data?.signedUrl) {
+        throw aidatHata(
+          'Dekont bağlantısı oluşturulamadı',
+          503
+        );
+      }
+
+      res.json({
+        url: data.signedUrl,
+        mime: aidat.dekont_mime,
+        dosya_adi: aidat.dekont_adi,
+        gecerlilik_saniye: 120,
+      });
+    } catch (hata) {
+      aidatCevap(res, hata);
+    }
   }
-});
-// Aidatı "ödendi" olarak işaretle
-app.patch('/dues/:id/pay', girisGerekli, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const sonuc = await pool.query(
-      'UPDATE dues SET odendi = true, odeme_tarihi = now() WHERE id = $1 RETURNING *',
-      [id]
-    );
-    res.json(sonuc.rows[0]);
-  } catch (hata) {
-    console.error(hata);
-    res.status(500).json({ mesaj: 'Hata: ödeme işaretlenemedi' });
-  }
-});
+);
 
+// Antrenör dekontu onaylar veya reddeder.
+app.patch(
+  '/dues/:id/review',
+  girisGerekli,
+  sadeceAntrenor,
+  async (req, res) => {
+    try {
+      const id = aidatIdOku(req.params.id);
+      const veri = req.body || {};
+
+      if (!['onayla', 'reddet'].includes(veri.karar)) {
+        throw aidatHata('Geçerli karar seç');
+      }
+
+      const neden =
+        typeof veri.neden === 'string'
+          ? veri.neden.trim()
+          : '';
+
+      if (
+        veri.karar === 'reddet' &&
+        (!neden || neden.length > 500)
+      ) {
+        throw aidatHata('1–500 karakter ret nedeni gir');
+      }
+
+      const onay = veri.karar === 'onayla';
+
+      const sonuc = await pool.query(
+        `
+          UPDATE dues
+          SET dekont_durum = $2,
+              odendi = $3,
+              odeme_tarihi =
+                CASE WHEN $3 THEN now() ELSE NULL END,
+              dekont_ret_nedeni = $4,
+              onaylayan_id = $5,
+              onay_tarihi = now()
+          WHERE id = $1
+            AND odendi IS NOT TRUE
+            AND dekont_durum = 'onay_bekliyor'
+            AND dekont_path IS NOT NULL
+          RETURNING id
+        `,
+        [
+          id,
+          onay ? 'onaylandi' : 'reddedildi',
+          onay,
+          onay ? null : neden,
+          req.user.id,
+        ]
+      );
+
+      if (!sonuc.rows.length) {
+        throw aidatHata(
+          'Kayıt artık onay beklemiyor. Listeyi yenile.',
+          409
+        );
+      }
+
+      res.json({
+        mesaj: onay
+          ? 'Ödeme onaylandı'
+          : 'Dekont reddedildi',
+      });
+    } catch (hata) {
+      aidatCevap(res, hata);
+    }
+  }
+);
+
+// Elden alınan ödeme gibi dekontsuz ödemeler.
+app.patch(
+  '/dues/:id/pay',
+  girisGerekli,
+  sadeceAntrenor,
+  async (req, res) => {
+    try {
+      const id = aidatIdOku(req.params.id);
+
+      const sonuc = await pool.query(
+        `
+          UPDATE dues
+          SET odendi = true,
+              odeme_tarihi = now(),
+              onaylayan_id = $2,
+              onay_tarihi = now(),
+              dekont_durum =
+                CASE
+                  WHEN dekont_path IS NULL
+                    THEN 'bekleniyor'
+                  ELSE 'onaylandi'
+                END,
+              dekont_ret_nedeni = NULL
+          WHERE id = $1
+            AND odendi IS NOT TRUE
+            AND dekont_durum <> 'onay_bekliyor'
+          RETURNING id
+        `,
+        [id, req.user.id]
+      );
+
+      if (!sonuc.rows.length) {
+        throw aidatHata(
+          'Kayıt bulunamadı, zaten ödendi veya dekont onayı bekliyor. Listeyi yenile.',
+          409
+        );
+      }
+
+      res.json({ mesaj: 'Ödeme kaydedildi' });
+    } catch (hata) {
+      aidatCevap(res, hata);
+    }
+  }
+);
 // ---------------- KULLANICI YÖNETİMİ (VELİ / SPORCU HESAPLARI) ----------------
 
 // Antrenör panelinden sisteme kayıtlı veli/sporcu hesaplarını listeler.
@@ -1247,6 +1787,21 @@ require('./sporcu_kayit')(
   sporcuOzelProfil
 );
 
-app.listen(PORT, () => {
-  console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Poseidon sunucusu ${PORT} portunda çalışıyor`);
+}); 
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({
+      mesaj: 'Dosya en fazla 5 MB olmalı',
+    });
+  }
+
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      mesaj: 'Geçersiz JSON gövdesi',
+    });
+  }
+
+  next(err);
 });

@@ -48,7 +48,7 @@ module.exports = function veliKayitKur(app, pool, bcrypt, girisGerekli, sadeceAn
     try{if(req.user.role!=='veli')throw fail('Veli hesabı gerekli',403);res.json(await cocuklar(req.user.id));}catch(e){cevap(res,e);}
   });
   // Veli için kişisel ekranları seçilen çocukla sınırla.
-  for(const path of ['/dues','/report-cards']){
+  for(const path of ['/report-cards']){
     app.get(path,girisGerekli,async(req,res,next)=>{
       if(req.user.role!=='veli')return next();
       try{

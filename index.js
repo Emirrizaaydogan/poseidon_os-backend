@@ -7,11 +7,15 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const path = require('path');
-
+const compression = require('compression');
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
 app.use(cors());
+app.use(compression({
+  level: 4,
+  threshold: 1024,
+}));
 app.use(
   '/athletes/onboard',
   girisGerekli,
